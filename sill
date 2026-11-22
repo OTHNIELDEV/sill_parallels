@@ -1,0 +1,494 @@
+#!/usr/bin/env bash
+# Sill — Mac 위의 Windows 창턱. Windows 가상 머신을 만들고 실행하는 도구 (QEMU + Apple Hypervisor.framework)
+#
+#   Apple Silicon → Windows 11 ARM64 (qemu-system-aarch64 · virt · HVF)
+#   Intel Mac     → Windows 10/11 x64  (qemu-system-x86_64 · q35 · HVF)
+#
+# macOS 기본 bash 3.2 에서 돌도록 쓴다 — 연관 배열 · ${x,,} · mapfile 금지.
+set -euo pipefail
+
+VERSION="0.1.0"
+SILL_HOME="${SILL_HOME:-$HOME/Sill}"
+SELF_DIR="$(cd "$(dirname "$0")" && pwd)"
+TEMPLATE_DIR="$SELF_DIR/templates"
+
+# ── 출력 ─────────────────────────────────────────────────────────────
+c_red=$'\033[31m'; c_grn=$'\033[32m'; c_ylw=$'\033[33m'; c_dim=$'\033[2m'; c_off=$'\033[0m'
+[ -t 1 ] || { c_red=; c_grn=; c_ylw=; c_dim=; c_off=; }
+info() { printf '%s\n' "$*"; }
+ok()   { printf '%s✓%s %s\n' "$c_grn" "$c_off" "$*"; }
+warn() { printf '%s!%s %s\n' "$c_ylw" "$c_off" "$*" >&2; }
+die()  { printf '%s✗%s %s\n' "$c_red" "$c_off" "$*" >&2; exit 1; }
+
+# ── 호스트 판정 ──────────────────────────────────────────────────────
+host_os()   { uname -s; }
+host_arch() {
+  # SILL_ARCH 로 덮을 수 있다(시험용). arm64 → aarch64 로 맞춘다.
+  local a="${SILL_ARCH:-$(uname -m)}"
+  case "$a" in arm64|aarch64) echo aarch64 ;; x86_64|amd64) echo x86_64 ;; *) echo "$a" ;; esac
+}
+qemu_bin() { echo "qemu-system-$(host_arch)"; }
+
+# 가속기: Mac 은 hvf · Linux 는 kvm(있으면) · 그 밖 tcg. SILL_ACCEL 로 덮을 수 있다.
+accel() {
+  if [ -n "${SILL_ACCEL:-}" ]; then echo "$SILL_ACCEL"; return; fi
+  case "$(host_os)" in
+    Darwin) echo hvf ;;
+    Linux)  if [ -w /dev/kvm ]; then echo kvm; else echo tcg; fi ;;
+    *)      echo tcg ;;
+  esac
+}
+
+brew_prefix() { command -v brew >/dev/null 2>&1 && brew --prefix 2>/dev/null || true; }
+
+# 펌웨어는 코드 · 변수 파일을 같은 묶음에서 짝으로 고른다(묶음이 다르면 크기 · 형식이 어긋난다).
+# 한 줄 = "코드|변수". 변수가 비면 빈 파일로 시작한다(aarch64 만 — x86 OVMF 는 변수 틀이 필요하다).
+firmware_pairs() {
+  local bp; bp="$(brew_prefix)"
+  if [ -n "${SILL_FW_CODE:-}" ]; then echo "$SILL_FW_CODE|${SILL_FW_VARS:-}"; fi
+  if [ "$(host_arch)" = aarch64 ]; then
+    local d; for d in "$bp/share/qemu" /opt/homebrew/share/qemu /usr/local/share/qemu /usr/share/qemu; do
+      echo "$d/edk2-aarch64-code.fd|$d/edk2-arm-vars.fd"; done
+    echo "/usr/share/AAVMF/AAVMF_CODE.no-secboot.fd|/usr/share/AAVMF/AAVMF_VARS.fd"
+    echo "/usr/share/AAVMF/AAVMF_CODE.fd|/usr/share/AAVMF/AAVMF_VARS.fd"
+    echo "/usr/share/qemu-efi-aarch64/QEMU_EFI.fd|"
+  else
+    local d; for d in "$bp/share/qemu" /usr/local/share/qemu /usr/share/qemu; do
+      echo "$d/edk2-x86_64-code.fd|$d/edk2-i386-vars.fd"; done
+    echo "/usr/share/OVMF/OVMF_CODE_4M.fd|/usr/share/OVMF/OVMF_VARS_4M.fd"
+    echo "/usr/share/OVMF/OVMF_CODE.fd|/usr/share/OVMF/OVMF_VARS.fd"
+  fi
+}
+
+firmware_pair() { # 쓸 수 있는 첫 짝을 "코드|변수" 로
+  local line code vars
+  while IFS= read -r line; do
+    code="${line%%|*}"; vars="${line#*|}"
+    [ -f "$code" ] || continue
+    if [ -n "$vars" ] && [ -f "$vars" ]; then echo "$code|$vars"; return 0; fi
+    if [ "$(host_arch)" = aarch64 ] && [ -z "$vars" ]; then echo "$code|"; return 0; fi
+  done < <(firmware_pairs)
+  return 1
+}
+
+file_size() { wc -c < "$1" | tr -d ' '; }
+
+# aarch64 virt 의 pflash 는 정확히 64MiB 여야 한다 — 모자라면 뒤를 0 으로 채운다(희소 파일).
+pad_to() { local f="$1" size="$2"; [ "$(file_size "$f")" -ge "$size" ] || dd if=/dev/zero of="$f" bs=1 count=0 seek="$size" 2>/dev/null; }
+
+# ── VM 묶음 ──────────────────────────────────────────────────────────
+valid_name() { case "$1" in ''|*[!A-Za-z0-9._-]*|.*) return 1 ;; *) return 0 ;; esac; }
+vm_dir()     { echo "$SILL_HOME/$1.sill"; }
+need_vm()    { valid_name "$1" || die "VM 이름은 영문 · 숫자 · . _ - 만 쓸 수 있습니다: '$1'"; [ -f "$(vm_dir "$1")/config.env" ] || die "VM '$1' 이 없습니다 (sill list)"; }
+load_vm()    { need_vm "$1"; VM="$(vm_dir "$1")"; # shellcheck disable=SC1091
+               . "$VM/config.env"; RUN="$(run_dir "$1")"; }
+# 유닉스 소켓 경로는 macOS 104자 · Linux 108자 한도 — VM 폴더가 깊어도 되게 짧은 실행 폴더에 둔다.
+run_dir()    { local d="${SILL_RUN:-/tmp/sill-$(id -u)}/$1"; mkdir -p "$d"; chmod 700 "${d%/*}" "$d"; echo "$d"; }
+is_running() { local p="$1/qemu.pid"; [ -f "$p" ] && kill -0 "$(cat "$p")" 2>/dev/null; }
+
+next_rdp_port() {
+  local port=33890 used f
+  while :; do
+    used=0
+    for f in "$SILL_HOME"/*.sill/config.env; do
+      [ -f "$f" ] || continue
+      grep -qE "^RDP_PORT='?$port'?\$" "$f" && { used=1; break; }
+    done
+    [ "$used" = 0 ] && { echo "$port"; return; }
+    port=$((port + 1))
+  done
+}
+
+make_iso() { # make_iso <폴더> <출력 iso> <볼륨 이름>
+  if command -v hdiutil >/dev/null 2>&1; then
+    hdiutil makehybrid -quiet -iso -joliet -default-volume-name "$3" -o "$2" "$1"
+  elif command -v xorriso >/dev/null 2>&1; then
+    xorriso -as mkisofs -quiet -J -r -V "$3" -o "$2" "$1" 2>/dev/null
+  elif command -v mkisofs >/dev/null 2>&1; then
+    mkisofs -quiet -J -r -V "$3" -o "$2" "$1"
+  else
+    return 1
+  fi
+}
+
+# ── 명령: doctor ─────────────────────────────────────────────────────
+cmd_doctor() {
+  local bad=0 q; q="$(qemu_bin)"
+  info "sill $VERSION · 호스트 $(host_os) $(host_arch) · 가속기 $(accel)"
+  if [ "$(host_os)" = Darwin ]; then
+    if [ "$(sysctl -n kern.hv_support 2>/dev/null || echo 0)" = 1 ]; then ok "Hypervisor.framework 사용 가능"; else warn "kern.hv_support=0 — 하드웨어 가상화를 못 씁니다(매우 느림)"; fi
+  fi
+  if command -v "$q" >/dev/null 2>&1; then ok "$("$q" --version | head -1)"; else warn "$q 없음 → brew install qemu"; bad=1; fi
+  if command -v qemu-img >/dev/null 2>&1; then ok "qemu-img"; else warn "qemu-img 없음 → brew install qemu"; bad=1; fi
+  if command -v swtpm >/dev/null 2>&1; then ok "swtpm (가상 TPM 2.0)"; else warn "swtpm 없음 → brew install swtpm (Windows 11 필수 요건)"; bad=1; fi
+  if command -v hdiutil >/dev/null 2>&1 || command -v xorriso >/dev/null 2>&1 || command -v mkisofs >/dev/null 2>&1; then ok "ISO 생성기"; else warn "ISO 생성기 없음 (macOS 는 hdiutil 내장)"; bad=1; fi
+  local fw; fw="$(firmware_pair || true)"
+  if [ -n "$fw" ]; then
+    ok "UEFI 펌웨어: ${fw%%|*}"
+    if [ -n "${fw#*|}" ]; then ok "UEFI 변수 틀: ${fw#*|}"; else info "${c_dim}  UEFI 변수 틀 없음 — 빈 64MiB 로 시작${c_off}"; fi
+  else warn "UEFI 펌웨어를 못 찾음 (brew qemu 에 포함)"; bad=1; fi
+  [ "$bad" = 0 ] && ok "준비 완료" || { info ""; info "설치: sill deps"; return 1; }
+}
+
+cmd_deps() {
+  [ "$(host_os)" = Darwin ] || die "deps 는 macOS 전용입니다 (Linux: apt install qemu-system qemu-utils swtpm xorriso)"
+  command -v brew >/dev/null 2>&1 || die "Homebrew 가 필요합니다 → https://brew.sh"
+  info "brew install qemu swtpm"
+  brew install qemu swtpm
+}
+
+# ── 명령: create ─────────────────────────────────────────────────────
+cmd_create() {
+  local name="" iso="" virtio="" cpus="" ram=8 disk=80 user="" unattend=1
+  name="${1:-}"; [ $# -gt 0 ] && shift
+  valid_name "$name" || die "사용법: sill create <이름> --iso <Windows.iso> [--cpus N] [--ram GB] [--disk GB] [--virtio virtio-win.iso] [--user 계정] [--no-unattend]"
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --iso) iso="$2"; shift 2 ;;
+      --virtio) virtio="$2"; shift 2 ;;
+      --cpus) cpus="$2"; shift 2 ;;
+      --ram) ram="$2"; shift 2 ;;
+      --disk) disk="$2"; shift 2 ;;
+      --user) user="$2"; shift 2 ;;
+      --no-unattend) unattend=0; shift ;;
+      *) die "알 수 없는 옵션: $1" ;;
+    esac
+  done
+  [ -n "$iso" ] || die "--iso <Windows 설치 ISO> 가 필요합니다"
+  [ -f "$iso" ] || die "ISO 파일이 없습니다: $iso"
+  [ -z "$virtio" ] || [ -f "$virtio" ] || die "virtio 드라이버 ISO 가 없습니다: $virtio"
+  case "$ram$disk${cpus:-1}" in *[!0-9]*) die "--ram · --disk · --cpus 는 숫자만" ;; esac
+  [ "$ram" -ge 4 ] || die "Windows 11 은 RAM 4GB 이상이 필요합니다"
+  [ "$disk" -ge 64 ] || die "Windows 11 은 디스크 64GB 이상이 필요합니다"
+  case "$user" in *[!A-Za-z0-9._-]*) die "--user 는 영문 · 숫자 · . _ - 만" ;; esac
+  if [ -z "$cpus" ]; then
+    local n; n="$(sysctl -n hw.perflevel0.physicalcpu 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || nproc 2>/dev/null || echo 4)"
+    cpus=$(( n > 8 ? 8 : (n < 2 ? 2 : n) ))
+  fi
+
+  local vm; vm="$(vm_dir "$name")"
+  [ ! -e "$vm" ] || die "이미 있습니다: $vm"
+  command -v qemu-img >/dev/null 2>&1 || die "qemu-img 없음 → sill deps"
+  local fw code vars; fw="$(firmware_pair)" || die "UEFI 펌웨어를 못 찾음 → sill doctor"
+  code="${fw%%|*}"; vars="${fw#*|}"
+
+  mkdir -p "$vm/tpm"
+  trap 'rm -rf "$vm"' ERR
+  # 펌웨어: 코드는 복사(aarch64 는 64MiB 로 채움), 변수는 VM 마다 따로 쓴다.
+  cp "$code" "$vm/efi-code.fd"
+  if [ -n "$vars" ]; then cp "$vars" "$vm/efi-vars.fd"; else : > "$vm/efi-vars.fd"; fi
+  if [ "$(host_arch)" = aarch64 ]; then pad_to "$vm/efi-code.fd" 67108864; pad_to "$vm/efi-vars.fd" 67108864
+  fi
+  qemu-img create -q -f qcow2 "$vm/disk.qcow2" "${disk}G"
+
+  local abs_iso abs_virtio=""
+  abs_iso="$(cd "$(dirname "$iso")" && pwd)/$(basename "$iso")"
+  [ -z "$virtio" ] || abs_virtio="$(cd "$(dirname "$virtio")" && pwd)/$(basename "$virtio")"
+
+  if [ "$unattend" = 1 ]; then
+    build_unattend "$vm" "$user" || { warn "자동 설치 파일을 못 만들었습니다(ISO 생성기 없음) — 설치 화면에서 직접 진행"; unattend=0; }
+  fi
+
+  cat > "$vm/config.env" <<EOF
+# sill 설정 — 손으로 고쳐도 된다(sill start 가 읽는다)
+NAME='$name'
+ARCH='$(host_arch)'
+CPUS='$cpus'
+RAM_GB='$ram'
+DISK_GB='$disk'
+INSTALL_ISO='$abs_iso'
+VIRTIO_ISO='$abs_virtio'
+UNATTEND='$unattend'
+RDP_PORT='$(next_rdp_port)'
+AUDIO='1'
+CREATED='$(date '+%Y-%m-%d %H:%M')'
+EOF
+  trap - ERR
+  ok "VM '$name' 생성: $vm"
+  info "  CPU $cpus · RAM ${ram}GB · 디스크 ${disk}GB(필요한 만큼만 차지) · TPM 2.0 · UEFI"
+  [ -n "$abs_virtio" ] || [ "$(host_arch)" != aarch64 ] || warn "virtio 드라이버 ISO 가 없으면 설치 뒤 인터넷이 안 됩니다 → sill drivers 로 받은 뒤 --virtio 로 다시 만들거나 config.env 의 VIRTIO_ISO 에 경로를 넣으세요"
+  info ""
+  info "다음: sill start $name"
+}
+
+build_unattend() { # build_unattend <vm 폴더> <계정>
+  local vm="$1" user="$2" arch="arm64" drvarch="ARM64" tmp
+  [ "$(host_arch)" = aarch64 ] || { arch="amd64"; drvarch="amd64"; }
+  tmp="$vm/.unattend"; mkdir -p "$tmp"
+  local local_account="" autologon=""
+  if [ -n "$user" ]; then
+    # 암호 없는 로컬 계정 — 첫 로그인 뒤 Windows 설정에서 암호를 정하도록 안내한다.
+    local_account="<UserAccounts><LocalAccounts><LocalAccount wcm:action=\"add\"><Name>$user</Name><Group>Administrators</Group><Password><Value></Value><PlainText>true</PlainText></Password></LocalAccount></LocalAccounts></UserAccounts>"
+    autologon="<AutoLogon><Enabled>true</Enabled><LogonCount>1</LogonCount><Username>$user</Username><Password><Value></Value><PlainText>true</PlainText></Password></AutoLogon>"
+  fi
+  sed -e "s/@ARCH@/$arch/g" -e "s/@DRVARCH@/$drvarch/g" \
+      -e "s#@LOCAL_ACCOUNT@#$local_account#" \
+      -e "s#@AUTOLOGON@#$autologon#" \
+      "$TEMPLATE_DIR/autounattend.xml" > "$tmp/autounattend.xml"
+  make_iso "$tmp" "$vm/unattend.iso" SILL_SETUP
+  rm -rf "$tmp"
+}
+
+# ── 명령: start ──────────────────────────────────────────────────────
+qemu_args() { # VM · 설정이 읽힌 상태에서 QEMU 인자를 한 줄에 하나씩 출력
+  local mode="$1" a; a="$(accel)"
+  if [ "$ARCH" = aarch64 ]; then
+    echo -M; echo "virt,highmem=on,gic-version=$([ "$a" = hvf ] && echo 2 || echo 3)"
+    echo -accel; echo "$a"
+    echo -cpu; [ "$a" = tcg ] && echo max || echo host
+  else
+    echo -M; echo q35
+    echo -accel; echo "$a"
+    echo -cpu; [ "$a" = tcg ] && echo max || echo "host,hv_relaxed,hv_vapic,hv_spinlocks=0x1fff,hv_time"
+  fi
+  echo -smp; echo "$CPUS"
+  echo -m; echo "${RAM_GB}G"
+  echo -name; echo "$NAME"
+  echo -rtc; echo "base=localtime,clock=host"
+  echo -drive; echo "if=pflash,format=raw,readonly=on,file=$VM/efi-code.fd"
+  echo -drive; echo "if=pflash,format=raw,file=$VM/efi-vars.fd"
+  # 디스크: NVMe — Windows 에 기본 드라이버가 있어 설치 때 드라이버를 안 넣어도 된다.
+  echo -drive; echo "if=none,id=disk0,format=qcow2,file=$VM/disk.qcow2,discard=unmap,detect-zeroes=unmap"
+  echo -device; echo "nvme,drive=disk0,serial=sill-$NAME,bootindex=1"
+  # TPM 2.0 (swtpm)
+  echo -chardev; echo "socket,id=chrtpm,path=$RUN/tpm.sock"
+  echo -tpmdev; echo "emulator,id=tpm0,chardev=chrtpm"
+  echo -device; [ "$ARCH" = aarch64 ] && echo "tpm-tis-device,tpmdev=tpm0" || echo "tpm-tis,tpmdev=tpm0"
+  # USB: 키보드 · 태블릿(마우스가 창 안팎을 자연스럽게 오간다)
+  echo -device; echo "qemu-xhci,id=xhci"
+  echo -device; echo "usb-kbd,bus=xhci.0"
+  echo -device; echo "usb-tablet,bus=xhci.0"
+  # 설치 매체 · 드라이버 · 자동 설치 파일
+  local idx=2 media
+  for media in "$INSTALL_ISO" "$VIRTIO_ISO" "$([ "${UNATTEND:-0}" = 1 ] && echo "$VM/unattend.iso")"; do
+    [ -n "$media" ] && [ -f "$media" ] || continue
+    echo -drive; echo "if=none,id=cd$idx,media=cdrom,readonly=on,file=$media"
+    if [ "$ARCH" = aarch64 ]; then echo -device; echo "usb-storage,bus=xhci.0,drive=cd$idx,removable=on,bootindex=$idx"
+    else echo -device; echo "ide-cd,bus=ide.$((idx - 1)),drive=cd$idx,bootindex=$idx"; fi
+    idx=$((idx + 1))
+  done
+  # 네트워크: 사용자 모드 NAT + RDP 포트를 Mac 의 127.0.0.1 로만 연다.
+  echo -netdev; echo "user,id=net0,hostfwd=tcp:127.0.0.1:$RDP_PORT-:3389"
+  echo -device; [ "$ARCH" = aarch64 ] && echo "virtio-net-pci,netdev=net0" || echo "e1000e,netdev=net0"
+  # 화면
+  if [ "$ARCH" = aarch64 ]; then echo -device; echo ramfb; else echo -vga; echo std; fi
+  # 소리
+  if [ "${AUDIO:-1}" = 1 ]; then
+    echo -audiodev; [ "$(host_os)" = Darwin ] && echo "coreaudio,id=snd0" || echo "none,id=snd0"
+    echo -device; echo intel-hda
+    echo -device; echo "hda-duplex,audiodev=snd0"
+  fi
+  echo -qmp; echo "unix:$RUN/qmp.sock,server=on,wait=off"
+  echo -pidfile; echo "$VM/qemu.pid"
+  case "$mode" in
+    window)
+      echo -display
+      if [ "$(host_os)" = Darwin ]; then echo "cocoa,zoom-to-fit=on,show-cursor=off"; else echo "${SILL_DISPLAY:-gtk}"; fi ;;
+    background)
+      echo -display; echo none
+      echo -vnc; echo "127.0.0.1:${VNC_DISPLAY:-$((RDP_PORT - 33890 + 10))}"
+      echo -daemonize ;;
+  esac
+}
+
+start_tpm() {
+  rm -f "$RUN/tpm.sock" "$RUN/swtpm.pid"
+  [ "${#RUN}" -lt 90 ] || die "실행 폴더 경로가 너무 깁니다(소켓 한도): $RUN — SILL_RUN 을 짧게"
+  swtpm socket --tpm2 --tpmstate "dir=$VM/tpm" \
+    --ctrl "type=unixio,path=$RUN/tpm.sock" \
+    --pid "file=$RUN/swtpm.pid" --log "file=$VM/swtpm.log,level=1" \
+    --terminate --daemon || die "가상 TPM(swtpm)을 시작하지 못했습니다 — $VM/swtpm.log"
+  local i=0; while [ ! -S "$RUN/tpm.sock" ] && [ $i -lt 50 ]; do sleep 0.1; i=$((i + 1)); done
+  [ -S "$RUN/tpm.sock" ] || die "가상 TPM(swtpm)이 뜨지 않았습니다 — $VM/swtpm.log"
+}
+
+cmd_start() {
+  local name="${1:-}" mode=window dry=0; [ $# -gt 0 ] && shift
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --background|-b) mode=background; shift ;;
+      --dry-run) dry=1; shift ;;
+      *) die "알 수 없는 옵션: $1" ;;
+    esac
+  done
+  load_vm "$name"
+  is_running "$VM" && die "이미 실행 중입니다 (sill stop $NAME)"
+  local args=() line
+  while IFS= read -r line; do args+=("$line"); done < <(qemu_args "$mode")
+  if [ "$dry" = 1 ]; then printf '%s' "$(qemu_bin)"; printf ' %q' "${args[@]}"; echo; return; fi
+  command -v "$(qemu_bin)" >/dev/null 2>&1 || die "$(qemu_bin) 없음 → sill deps"
+  command -v swtpm >/dev/null 2>&1 || die "swtpm 없음 → sill deps"
+  [ -f "$INSTALL_ISO" ] || warn "설치 ISO 가 사라졌습니다(설치가 끝났다면 무시): $INSTALL_ISO"
+  start_tpm
+  info "▶ $NAME 시작 · RDP 127.0.0.1:$RDP_PORT ${c_dim}(sill rdp $NAME)${c_off}"
+  if [ "$mode" = background ]; then
+    "$(qemu_bin)" "${args[@]}" 2> "$VM/qemu.log" || die "QEMU 실행 실패 — $VM/qemu.log"
+    ok "백그라운드 실행 중 · 화면: vnc://127.0.0.1:$((5900 + RDP_PORT - 33890 + 10))"
+  else
+    "$(qemu_bin)" "${args[@]}" 2> >(tee "$VM/qemu.log" >&2) || warn "QEMU 가 오류로 끝났습니다 — $VM/qemu.log"
+    rm -f "$VM/qemu.pid" "$RUN/qmp.sock"
+  fi
+}
+
+# ── 명령: stop · status · list · delete ─────────────────────────────
+qmp() { # qmp <실행 폴더> <명령 JSON>
+  local sock="$1/qmp.sock"
+  [ -S "$sock" ] || return 1
+  { printf '{"execute":"qmp_capabilities"}\n'; sleep 0.3; printf '%s\n' "$2"; sleep 0.5; } \
+    | nc -w 2 -U "$sock" 2>/dev/null
+}
+
+cmd_stop() {
+  local name="${1:-}" force=0; [ $# -gt 0 ] && shift
+  [ "${1:-}" = --force ] && force=1
+  load_vm "$name"
+  is_running "$VM" || { info "$NAME 은 꺼져 있습니다"; return; }
+  if [ "$force" = 1 ]; then
+    qmp "$RUN" '{"execute":"quit"}' >/dev/null || kill "$(cat "$VM/qemu.pid")"
+    ok "$NAME 강제 종료"
+  else
+    qmp "$RUN" '{"execute":"system_powerdown"}' >/dev/null || die "QMP 소켓에 닿지 못했습니다 — sill stop $NAME --force"
+    info "Windows 에 종료 신호를 보냈습니다. 기다리는 중…"
+    local i=0; while is_running "$VM" && [ $i -lt 120 ]; do sleep 1; i=$((i + 1)); done
+    if is_running "$VM"; then die "120초 안에 꺼지지 않았습니다 — sill stop $NAME --force"; fi
+    ok "$NAME 종료"
+  fi
+  rm -f "$VM/qemu.pid" "$RUN/qmp.sock"
+}
+
+cmd_list() {
+  local f any=0 d
+  for f in "$SILL_HOME"/*.sill/config.env; do
+    [ -f "$f" ] || continue
+    any=1; d="$(dirname "$f")"
+    ( # shellcheck disable=SC1090
+      . "$f"
+      st="꺼짐"; is_running "$d" && st="${c_grn}실행 중${c_off}"
+      used="$(du -sh "$d/disk.qcow2" 2>/dev/null | cut -f1)"
+      printf '%-18s %-10s %s CPU · %sGB RAM · 디스크 %s/%sG · RDP %s\n' "$NAME" "$st" "$CPUS" "$RAM_GB" "$used" "$DISK_GB" "$RDP_PORT" )
+  done
+  [ "$any" = 1 ] || info "VM 이 없습니다 — sill create <이름> --iso <Windows.iso>"
+}
+
+cmd_delete() {
+  local name="${1:-}"; load_vm "$name"
+  is_running "$VM" && die "실행 중입니다 — 먼저 sill stop $NAME"
+  printf '"%s" 와 디스크를 영구 삭제합니다. 이름을 다시 입력하세요: ' "$NAME"
+  local ans; read -r ans
+  [ "$ans" = "$NAME" ] || die "취소"
+  rm -rf "$VM"; ok "삭제: $NAME"
+}
+
+# ── 명령: rdp — Mac 의 Windows App(Microsoft Remote Desktop)으로 연결 ─
+# 창 크기에 맞는 해상도 · 클립보드 · Mac 폴더 공유 · 소리를 RDP 가 맡는다(Parallels 의 통합 기능 대체).
+cmd_rdp() {
+  local name="${1:-}"; load_vm "$name"
+  local rdp="$VM/connect.rdp"
+  cat > "$rdp" <<EOF
+full address:s:127.0.0.1:$RDP_PORT
+prompt for credentials:i:1
+dynamic resolution:i:1
+smart sizing:i:1
+screen mode id:i:1
+use multimon:i:0
+redirectclipboard:i:1
+audiomode:i:0
+redirectprinters:i:0
+drivestoredirect:s:*
+authentication level:i:0
+EOF
+  ok "연결 파일: $rdp  (Mac 폴더 공유: 내 PC → '리디렉션된 드라이브')"
+  if command -v open >/dev/null 2>&1 && [ "$(host_os)" = Darwin ]; then
+    open "$rdp" || warn "App Store 에서 'Windows App'(Microsoft)을 설치하세요"
+  fi
+}
+
+# ── 명령: snapshot ───────────────────────────────────────────────────
+cmd_snapshot() {
+  local name="${1:-}" act="${2:-list}" tag="${3:-}"; load_vm "$name"
+  is_running "$VM" && die "스냅숏은 VM 을 끈 상태에서만 다룹니다 (sill stop $NAME)"
+  case "$act" in
+    list) qemu-img snapshot -l "$VM/disk.qcow2" ;;
+    save|restore|delete)
+      [ -n "$tag" ] || tag="$(date '+%Y%m%d-%H%M')"
+      case "$act" in
+        save) qemu-img snapshot -c "$tag" "$VM/disk.qcow2"; cp "$VM/efi-vars.fd" "$VM/efi-vars.$tag.fd"; ok "스냅숏 저장: $tag" ;;
+        restore) qemu-img snapshot -a "$tag" "$VM/disk.qcow2"; [ ! -f "$VM/efi-vars.$tag.fd" ] || cp "$VM/efi-vars.$tag.fd" "$VM/efi-vars.fd"; ok "되돌림: $tag" ;;
+        delete) qemu-img snapshot -d "$tag" "$VM/disk.qcow2"; rm -f "$VM/efi-vars.$tag.fd"; ok "스냅숏 삭제: $tag" ;;
+      esac ;;
+    *) die "사용법: sill snapshot <이름> list|save|restore|delete [태그]" ;;
+  esac
+}
+
+# ── 명령: set — 설정 바꾸기(꺼진 상태) ──────────────────────────────
+cmd_set() {
+  local name="${1:-}" key="${2:-}" val="${3:-}"; load_vm "$name"
+  is_running "$VM" && die "꺼진 상태에서 바꿉니다"
+  case "$key" in
+    cpus|ram|audio) case "$val" in ''|*[!0-9]*) die "숫자만" ;; esac ;;
+    iso|virtio) [ -z "$val" ] || [ -f "$val" ] || die "파일이 없습니다: $val"
+                [ -z "$val" ] || val="$(cd "$(dirname "$val")" && pwd)/$(basename "$val")" ;;
+    disk) case "$val" in ''|*[!0-9]*) die "숫자만(GB)" ;; esac
+          [ "$val" -gt "$DISK_GB" ] || die "디스크는 늘리기만 됩니다(지금 ${DISK_GB}G)"
+          qemu-img resize -q "$VM/disk.qcow2" "${val}G"
+          info "Windows 안 '디스크 관리'에서 C: 볼륨 확장을 누르세요" ;;
+    *) die "사용법: sill set <이름> cpus|ram|disk|audio|iso|virtio <값>" ;;
+  esac
+  local var
+  case "$key" in cpus) var=CPUS ;; ram) var=RAM_GB ;; disk) var=DISK_GB ;; audio) var=AUDIO ;; iso) var=INSTALL_ISO ;; virtio) var=VIRTIO_ISO ;; esac
+  grep -v "^$var=" "$VM/config.env" > "$VM/config.env.new"; echo "$var='$val'" >> "$VM/config.env.new"
+  mv "$VM/config.env.new" "$VM/config.env"; ok "$NAME: $var=$val"
+}
+
+# ── 명령: drivers — virtio 드라이버 ISO 받기 ─────────────────────────
+cmd_drivers() {
+  local out="$SILL_HOME/virtio-win.iso"
+  local url="https://fedorapeople.org/groups/virt/virtio-win/direct-downloads/latest-virtio/virtio-win.iso"
+  mkdir -p "$SILL_HOME"
+  info "virtio-win 드라이버 받는 중 → $out"
+  curl -fL --progress-bar -o "$out.part" "$url" && mv "$out.part" "$out"
+  ok "받음: $out"
+  info "기존 VM 에 넣기: sill set <이름> virtio $out"
+}
+
+usage() {
+  cat <<EOF
+Sill $VERSION — Mac 위의 Windows 창턱 (QEMU + Hypervisor.framework)
+
+  sill doctor                      준비 상태 점검
+  sill deps                        필요한 도구 설치 (brew install qemu swtpm)
+  sill drivers                     virtio 드라이버 ISO 받기 (Apple Silicon 네트워크용)
+  sill create <이름> --iso <ISO>    VM 만들기  [--cpus N] [--ram GB] [--disk GB]
+                                       [--virtio virtio-win.iso] [--user 계정] [--no-unattend]
+  sill start <이름> [--background]  실행 (창 / 백그라운드+VNC)  [--dry-run]
+  sill rdp <이름>                   Windows App 으로 연결 (해상도 · 클립보드 · 폴더 공유)
+  sill stop <이름> [--force]        종료 (Windows 정상 종료 / 강제)
+  sill list                        VM 목록
+  sill set <이름> <키> <값>          cpus · ram · disk · audio · iso · virtio
+  sill snapshot <이름> list|save|restore|delete [태그]
+  sill delete <이름>                삭제
+
+VM 위치: $SILL_HOME  (SILL_HOME 으로 바꿀 수 있음)
+EOF
+}
+
+main() {
+  local cmd="${1:-help}"; [ $# -gt 0 ] && shift
+  case "$cmd" in
+    doctor) cmd_doctor "$@" ;;
+    deps) cmd_deps "$@" ;;
+    drivers) cmd_drivers "$@" ;;
+    create) cmd_create "$@" ;;
+    start) cmd_start "$@" ;;
+    stop) cmd_stop "$@" ;;
+    list|ls) cmd_list ;;
+    rdp) cmd_rdp "$@" ;;
+    set) cmd_set "$@" ;;
+    snapshot) cmd_snapshot "$@" ;;
+    delete|rm) cmd_delete "$@" ;;
+    version|--version) echo "sill $VERSION" ;;
+    help|-h|--help) usage ;;
+    *) usage; exit 1 ;;
+  esac
+}
+main "$@"

@@ -1,0 +1,6 @@
+# 시험 · 개인 VM 파일이 레포에 들어가지 않게
+*.iso
+*.qcow2
+*.fd
+*.sill/
+.DS_Store
