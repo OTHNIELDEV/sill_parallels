@@ -286,8 +286,9 @@ qemu_args() { # VM · 설정이 읽힌 상태에서 QEMU 인자를 한 줄에 �
       if [ "$(host_os)" = Darwin ]; then echo "cocoa,zoom-to-fit=on,show-cursor=off"; else echo "${SILL_DISPLAY:-gtk}"; fi ;;
     background)
       echo -display; echo none
-      echo -vnc; echo "127.0.0.1:${VNC_DISPLAY:-$((RDP_PORT - 33890 + 10))}"
-      echo -daemonize ;;
+      echo -vnc; echo "127.0.0.1:${VNC_DISPLAY:-$((RDP_PORT - 33890 + 10))}" ;;
+      # -daemonize 는 쓰지 않는다 — macOS 에서 CoreAudio(Objective-C)가 초기화된 뒤 fork 하면
+      # objc fork 안전 검사가 QEMU 를 죽인다(GitHub macOS 실행기 실측). 엔진이 직접 떼어 띄운다.
   esac
 }
 
@@ -353,7 +354,14 @@ cmd_start() {
   start_tpm
   info "▶ $NAME 시작 · RDP 127.0.0.1:$RDP_PORT ${c_dim}(sill rdp $NAME)${c_off}"
   if [ "$mode" = background ]; then
-    if ! ( detach_fds; exec "$(qemu_bin)" "${args[@]}" ) </dev/null >"$VM/qemu.log" 2>&1; then
+    ( detach_fds; exec "$(qemu_bin)" "${args[@]}" ) </dev/null >"$VM/qemu.log" 2>&1 &
+    local qpid=$! i=0
+    # QMP 소켓이 생기면 기계가 떴다. 그 전에 QEMU 가 끝나면 실패.
+    while [ $i -lt 150 ] && [ ! -S "$RUN/qmp.sock" ] && kill -0 "$qpid" 2>/dev/null; do
+      sleep 0.1; i=$((i + 1))
+    done
+    if ! kill -0 "$qpid" 2>/dev/null || [ ! -S "$RUN/qmp.sock" ]; then
+      kill "$qpid" 2>/dev/null || true
       stop_tpm; show_log_tail "$VM/qemu.log"; die "QEMU 실행 실패 — $VM/qemu.log"
     fi
     ok "백그라운드 실행 중 · 화면: vnc://127.0.0.1:$((5900 + RDP_PORT - 33890 + 10))"
