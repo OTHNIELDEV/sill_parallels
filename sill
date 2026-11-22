@@ -7,7 +7,7 @@
 # macOS 기본 bash 3.2 에서 돌도록 쓴다 — 연관 배열 · ${x,,} · mapfile 금지.
 set -euo pipefail
 
-VERSION="0.1.0"
+VERSION="0.1.1"
 SILL_HOME="${SILL_HOME:-$HOME/Sill}"
 SELF_DIR="$(cd "$(dirname "$0")" && pwd)"
 TEMPLATE_DIR="$SELF_DIR/templates"

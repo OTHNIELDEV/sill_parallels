@@ -32,13 +32,16 @@ jobs:
       - name: 범용 앱 · DMG
         run: ./app/scripts/build-dmg.sh --universal
 
-      - name: 두 칩 모두 들어 있는지
+      - name: 두 칩 · 아이콘 · 판 번호 확인
         run: |
           archs="$(lipo -archs app/build/Sill.app/Contents/MacOS/Sill)"
           echo "아키텍처: $archs"
           echo "$archs" | grep -q arm64
           echo "$archs" | grep -q x86_64
           codesign --verify --deep app/build/Sill.app
+          test -f app/build/Sill.app/Contents/Resources/AppIcon.icns
+          [ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIconFile' app/build/Sill.app/Contents/Info.plist)" = AppIcon ]
+          [ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' app/build/Sill.app/Contents/Info.plist)" = "${{ steps.v.outputs.version }}" ]
 
       - name: GitHub Release
         env:
@@ -48,6 +51,11 @@ jobs:
           tag="v$VERSION"
           files=(app/build/Sill-$VERSION.dmg app/build/Sill-$VERSION.zip)
           sed "s/@VERSION@/$VERSION/g" .github/release-notes.md > notes.md
+          # CHANGELOG.md 의 「## <판>」 절을 안내문 앞에 붙인다
+          changes="$(awk -v v="## $VERSION" '$0==v{f=1;next} /^## /{f=0} f' CHANGELOG.md)"
+          if [ -n "$changes" ]; then
+            { echo "### 바뀐 점"; echo "$changes"; echo; cat notes.md; } > notes.tmp && mv notes.tmp notes.md
+          fi
           ( cd app/build && shasum -a 256 "Sill-$VERSION.dmg" "Sill-$VERSION.zip" ) | tee -a notes.md
           if gh release view "$tag" >/dev/null 2>&1; then
             gh release upload "$tag" "${files[@]}" --clobber

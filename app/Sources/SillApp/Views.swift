@@ -81,9 +81,9 @@ struct WelcomeView: View {
 
     var body: some View {
         VStack(spacing: 18) {
-            Image(systemName: "macwindow.on.rectangle")
-                .font(.system(size: 64, weight: .thin))
-                .foregroundColor(.accentColor)
+            Image(nsImage: NSApp.applicationIconImage)
+                .resizable()
+                .frame(width: 112, height: 112)
             Text("Sill").font(.largeTitle.bold())
             Text("Mac 위의 Windows 창턱")
                 .font(.title3)

@@ -1,3 +1,5 @@
+<img src="app/Resources/icon/AppIcon-1024.png" width="128" alt="Sill 아이콘">
+
 # Sill — Mac 위의 Windows 창턱
 
 > **Sill**(실) = 창턱(window sill). Mac 이라는 창턱 위에 Windows 창을 올려놓는다는 뜻입니다.
@@ -147,14 +149,15 @@ app/                 SwiftUI 앱 (Swift Package)
   Sources/SillCore   엔진 실행 · VM 목록 · 입력 검사 (Foundation 만 — Linux 에서도 시험)
   Sources/SillApp    화면 (macOS 전용)
   Tests/             단위 시험 + 실제 엔진으로 VM 만들기 · 부팅 · 종료 · 삭제
-  scripts/build-app.sh  Sill.app 묶음 · build-dmg.sh DMG
+  scripts/build-app.sh  Sill.app 묶음 · build-dmg.sh DMG · make-icon.mjs 아이콘
+  Resources/icon/AppIcon.svg  아이콘 원본 (고친 뒤 make-icon.mjs → AppIcon.icns)
 .github/workflows/release.yml  범용 DMG · zip → GitHub Release
 .github/workflows/   Linux(엔진) · macOS(엔진 + 앱 빌드 · 시험 · Sill.app) 자동 검사
 ```
 
 ## 로드맵
 
-1. 앱 아이콘 · Developer ID 서명 · 공증 → 다른 Mac 에 배포
+1. Developer ID 서명 · 공증 → 다른 Mac 에 배포 (지금은 개인용)
 2. RDP RemoteApp 으로 Windows 앱 하나만 Mac 창처럼 띄우기(Coherence 대체)
 3. USB 장치 연결 · 실행 중 일시정지/재개
 
