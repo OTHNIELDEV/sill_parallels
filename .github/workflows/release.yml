@@ -51,6 +51,7 @@ jobs:
           ( cd app/build && shasum -a 256 "Sill-$VERSION.dmg" "Sill-$VERSION.zip" ) | tee -a notes.md
           if gh release view "$tag" >/dev/null 2>&1; then
             gh release upload "$tag" "${files[@]}" --clobber
+            gh release edit "$tag" --title "Sill $VERSION" --notes-file notes.md
           else
             gh release create "$tag" "${files[@]}" --target "$GITHUB_SHA" \
               --title "Sill $VERSION" --notes-file notes.md --latest

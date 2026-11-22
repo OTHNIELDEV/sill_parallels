@@ -1,9 +1,9 @@
-## Sill @VERSION — Mac 위의 Windows 창턱
+## Sill @VERSION@ — Mac 위의 Windows 창턱
 
 **Apple Silicon · Intel 공용(universal) · macOS 13 이상**
 
 ### 설치
-1. 아래 **`Sill-@VERSION.dmg`** 를 받아 열고, `Sill.app` 을 「Applications」로 끌어 넣습니다.
+1. 아래 **`Sill-@VERSION@.dmg`** 를 받아 열고, `Sill.app` 을 「Applications」로 끌어 넣습니다.
 2. 처음 한 번 — Apple 개발자 서명이 없는 개인용 빌드라 macOS 가 막습니다. 한 번 열어 본 뒤
    **시스템 설정 → 개인정보 보호 및 보안 → 「그래도 열기」**, 또는 터미널에서
    ```
@@ -15,7 +15,7 @@
 ### 파일
 | 파일 | 용도 |
 |------|------|
-| `Sill-@VERSION.dmg` | 설치용 (권장) |
-| `Sill-@VERSION.zip` | 같은 앱을 zip 으로 |
+| `Sill-@VERSION@.dmg` | 설치용 (권장) |
+| `Sill-@VERSION@.zip` | 같은 앱을 zip 으로 |
 
 SHA-256:
