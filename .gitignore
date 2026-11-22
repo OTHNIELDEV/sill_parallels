@@ -4,3 +4,7 @@
 *.fd
 *.sill/
 .DS_Store
+# Swift 빌드 산출물
+app/.build/
+app/build/
+app/.swiftpm/

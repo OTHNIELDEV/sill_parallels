@@ -291,13 +291,35 @@ qemu_args() { # VM · 설정이 읽힌 상태에서 QEMU 인자를 한 줄에 �
   esac
 }
 
+# 데몬(swtpm · 백그라운드 QEMU)에게 부른 쪽이 연 파일(관 · 소켓)을 물려주지 않는다.
+# 물려주면 Sill 앱 같은 호출자가 엔진이 끝난 것을 알아채지 못하고 멈춘다(앱 시험이 재현했다).
+detach_fds() {
+  local f fd
+  for f in /dev/fd/*; do
+    fd="${f##*/}"
+    case "$fd" in ''|*[!0-9]*) continue ;; esac
+    if [ "$fd" -gt 2 ]; then eval "exec $fd>&-" 2>/dev/null || true; fi
+  done
+  return 0
+}
+
+port_in_use() { nc -z -w 1 127.0.0.1 "$1" >/dev/null 2>&1; }
+
+stop_tpm() { # QEMU 가 붙지 못하고 끝났을 때 남는 swtpm 을 치운다(--terminate 는 연결된 뒤에만 동작)
+  local p="$RUN/swtpm.pid"
+  if [ -f "$p" ]; then kill "$(cat "$p")" 2>/dev/null || true; rm -f "$p"; fi
+  rm -f "$RUN/tpm.sock"
+}
+
 start_tpm() {
   rm -f "$RUN/tpm.sock" "$RUN/swtpm.pid"
   [ "${#RUN}" -lt 90 ] || die "실행 폴더 경로가 너무 깁니다(소켓 한도): $RUN — SILL_RUN 을 짧게"
-  swtpm socket --tpm2 --tpmstate "dir=$VM/tpm" \
-    --ctrl "type=unixio,path=$RUN/tpm.sock" \
-    --pid "file=$RUN/swtpm.pid" --log "file=$VM/swtpm.log,level=1" \
-    --terminate --daemon || die "가상 TPM(swtpm)을 시작하지 못했습니다 — $VM/swtpm.log"
+  ( detach_fds
+    exec swtpm socket --tpm2 --tpmstate "dir=$VM/tpm" \
+      --ctrl "type=unixio,path=$RUN/tpm.sock" \
+      --pid "file=$RUN/swtpm.pid" --log "file=$VM/swtpm.log,level=1" \
+      --terminate --daemon ) </dev/null >>"$VM/swtpm.log" 2>&1 \
+    || die "가상 TPM(swtpm)을 시작하지 못했습니다 — $VM/swtpm.log"
   local i=0; while [ ! -S "$RUN/tpm.sock" ] && [ $i -lt 50 ]; do sleep 0.1; i=$((i + 1)); done
   [ -S "$RUN/tpm.sock" ] || die "가상 TPM(swtpm)이 뜨지 않았습니다 — $VM/swtpm.log"
 }
@@ -319,13 +341,19 @@ cmd_start() {
   command -v "$(qemu_bin)" >/dev/null 2>&1 || die "$(qemu_bin) 없음 → sill deps"
   command -v swtpm >/dev/null 2>&1 || die "swtpm 없음 → sill deps"
   [ -f "$INSTALL_ISO" ] || warn "설치 ISO 가 사라졌습니다(설치가 끝났다면 무시): $INSTALL_ISO"
+  if port_in_use "$RDP_PORT"; then
+    die "RDP 포트 $RDP_PORT 를 다른 프로그램이 쓰고 있습니다 → sill set $NAME rdp_port <다른 번호>"
+  fi
   start_tpm
   info "▶ $NAME 시작 · RDP 127.0.0.1:$RDP_PORT ${c_dim}(sill rdp $NAME)${c_off}"
   if [ "$mode" = background ]; then
-    "$(qemu_bin)" "${args[@]}" 2> "$VM/qemu.log" || die "QEMU 실행 실패 — $VM/qemu.log"
+    if ! ( detach_fds; exec "$(qemu_bin)" "${args[@]}" ) </dev/null >"$VM/qemu.log" 2>&1; then
+      stop_tpm; die "QEMU 실행 실패 — $VM/qemu.log"
+    fi
     ok "백그라운드 실행 중 · 화면: vnc://127.0.0.1:$((5900 + RDP_PORT - 33890 + 10))"
   else
     "$(qemu_bin)" "${args[@]}" 2> >(tee "$VM/qemu.log" >&2) || warn "QEMU 가 오류로 끝났습니다 — $VM/qemu.log"
+    stop_tpm
     rm -f "$VM/qemu.pid" "$RUN/qmp.sock"
   fi
 }
@@ -426,16 +454,18 @@ cmd_set() {
   is_running "$VM" && die "꺼진 상태에서 바꿉니다"
   case "$key" in
     cpus|ram|audio) case "$val" in ''|*[!0-9]*) die "숫자만" ;; esac ;;
+    rdp_port) case "$val" in ''|*[!0-9]*) die "숫자만" ;; esac
+              [ "$val" -ge 1024 ] && [ "$val" -le 65535 ] || die "1024 ~ 65535" ;;
     iso|virtio) [ -z "$val" ] || [ -f "$val" ] || die "파일이 없습니다: $val"
                 [ -z "$val" ] || val="$(cd "$(dirname "$val")" && pwd)/$(basename "$val")" ;;
     disk) case "$val" in ''|*[!0-9]*) die "숫자만(GB)" ;; esac
           [ "$val" -gt "$DISK_GB" ] || die "디스크는 늘리기만 됩니다(지금 ${DISK_GB}G)"
           qemu-img resize -q "$VM/disk.qcow2" "${val}G"
           info "Windows 안 '디스크 관리'에서 C: 볼륨 확장을 누르세요" ;;
-    *) die "사용법: sill set <이름> cpus|ram|disk|audio|iso|virtio <값>" ;;
+    *) die "사용법: sill set <이름> cpus|ram|disk|audio|iso|virtio|rdp_port <값>" ;;
   esac
   local var
-  case "$key" in cpus) var=CPUS ;; ram) var=RAM_GB ;; disk) var=DISK_GB ;; audio) var=AUDIO ;; iso) var=INSTALL_ISO ;; virtio) var=VIRTIO_ISO ;; esac
+  case "$key" in rdp_port) var=RDP_PORT ;; cpus) var=CPUS ;; ram) var=RAM_GB ;; disk) var=DISK_GB ;; audio) var=AUDIO ;; iso) var=INSTALL_ISO ;; virtio) var=VIRTIO_ISO ;; esac
   grep -v "^$var=" "$VM/config.env" > "$VM/config.env.new"; echo "$var='$val'" >> "$VM/config.env.new"
   mv "$VM/config.env.new" "$VM/config.env"; ok "$NAME: $var=$val"
 }
@@ -464,7 +494,7 @@ Sill $VERSION — Mac 위의 Windows 창턱 (QEMU + Hypervisor.framework)
   sill rdp <이름>                   Windows App 으로 연결 (해상도 · 클립보드 · 폴더 공유)
   sill stop <이름> [--force]        종료 (Windows 정상 종료 / 강제)
   sill list                        VM 목록
-  sill set <이름> <키> <값>          cpus · ram · disk · audio · iso · virtio
+  sill set <이름> <키> <값>          cpus · ram · disk · audio · iso · virtio · rdp_port
   sill snapshot <이름> list|save|restore|delete [태그]
   sill delete <이름>                삭제
 

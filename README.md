@@ -13,6 +13,22 @@ Parallels Desktop 처럼 Mac 위에 Windows 가상 머신을 만들고 실행하
 
 > Apple Silicon 에서는 **x64 Windows 를 실행할 수 없습니다**(Parallels 도 같음). 반드시 ARM64 판 ISO 를 쓰세요.
 
+## 0. 앱으로 쓰기 (SwiftUI · macOS 13 이상)
+
+```bash
+./app/scripts/build-app.sh      # → app/build/Sill.app  (Xcode 또는 Command Line Tools 필요)
+open app/build/Sill.app
+```
+
+- **왼쪽** VM 목록(실행 중 표시) · **오른쪽** 시작 · 창 없이 시작 · Windows App 연결 · 종료 · 스냅숏 · 삭제
+- **새 VM**(⌘N): 이름 · 설치 ISO · virtio 드라이버 · CPU · 메모리 · 디스크 · 로컬 계정
+- **준비 상태 점검**: QEMU · swtpm 확인, Homebrew 설치 단추, 드라이버 받기
+- **메뉴 막대 아이콘**: 창을 닫아도 VM 시작 · 연결 · 종료
+- 앱은 아래 명령행 엔진 `sill` 을 묶음 안에 넣어 그대로 부릅니다 — 화면과 명령행이 같은 VM 폴더(`~/Sill`)를 공유합니다.
+- 개발 중에는 `cd app && swift run` 으로도 띄울 수 있습니다.
+
+> 지금 서명은 임시(ad-hoc)라 **빌드한 그 Mac 에서만** 바로 열립니다. 다른 Mac 에 나눠 주려면 Apple Developer ID 서명 · 공증이 필요합니다.
+
 ## 1. 준비 (한 번)
 
 ```bash
@@ -67,7 +83,7 @@ RDP 포트는 Mac 의 `127.0.0.1` 에만 열립니다(외부에서 접근 불가
 ./sill snapshot win11 save before-update   # 꺼진 상태에서 디스크 + UEFI 상태 저장
 ./sill snapshot win11 restore before-update
 ./sill snapshot win11 list
-./sill set win11 ram 12                    # cpus · ram · audio · iso · virtio
+./sill set win11 ram 12                    # cpus · ram · audio · iso · virtio · rdp_port
 ./sill set win11 disk 120                  # 늘리기만 가능 → Windows '디스크 관리'에서 C: 확장
 ./sill delete win11
 ```
@@ -87,18 +103,18 @@ VM 은 `~/Sill/<이름>.sill/` 폴더 하나에 들어 있습니다(`disk.qcow2`
 | 3D 그래픽 가속(DirectX) | ❌ | QEMU 에 Windows 용 가속 드라이버가 없음 — 게임 · CAD 불가 |
 | Coherence(Windows 앱을 Mac 창처럼) | ❌ | RDP RemoteApp 으로 일부 가능(로드맵) |
 | USB 장치 연결 | ❌ | 로드맵 |
-| GUI 앱 | ❌ | 로드맵 (지금은 명령행 `sill`) |
+| GUI 앱 | ✅ | SwiftUI 앱 + 메뉴 막대 (0.1 — 기본 기능) |
 
 ### 왜 Apple 의 Virtualization.framework 가 아니라 QEMU 인가
 Virtualization.framework 는 Linux · macOS 게스트용으로 만들어졌고, 화면 장치(virtio-gpu)에 맞는 Windows 드라이버가 없어
 Windows 를 띄워도 화면이 나오지 않습니다. UTM 등 Windows 를 돌리는 무료 도구들도 같은 이유로 QEMU + HVF 를 씁니다.
 
-## 라이선스 · 주의
+## Windows 라이선스 · 주의
 
 - Windows 사용에는 정품 라이선스가 필요합니다(설치 중 「제품 키가 없음」으로 진행 가능 · 정품 인증 전에는 개인 설정 일부 제한).
 - Microsoft 가 Apple Silicon Mac 에서 「공식 지원」하는 방식은 Parallels Desktop · VMware Fusion 입니다. sill(QEMU) 으로도 실행되지만 Microsoft 지원 대상은 아닙니다.
 
-## 검증 기록 (2026-11-22)
+## 검증 기록 (2026-11-22 · 엔진)
 
 Linux 컨테이너(QEMU 8.2 · TCG 소프트웨어 에뮬레이션)에서 `test/smoke.sh` 로 확인했습니다 — 실제 Mac(HVF)에서는 아직 돌려 보지 않았습니다.
 
@@ -109,8 +125,26 @@ Linux 컨테이너(QEMU 8.2 · TCG 소프트웨어 에뮬레이션)에서 `test/
 
 Mac 에서 시험: `./test/smoke.sh` (가짜 ISO 로 1분 안에 끝남)
 
+## 폴더 구조
+
+```
+sill                 명령행 엔진 (bash · QEMU 실행의 유일한 길)
+templates/           Windows 자동 설치 응답 파일
+test/smoke.sh        엔진 연기 시험
+app/                 SwiftUI 앱 (Swift Package)
+  Sources/SillCore   엔진 실행 · VM 목록 · 입력 검사 (Foundation 만 — Linux 에서도 시험)
+  Sources/SillApp    화면 (macOS 전용)
+  Tests/             단위 시험 + 실제 엔진으로 VM 만들기 · 부팅 · 종료 · 삭제
+  scripts/build-app.sh  Sill.app 묶음
+.github/workflows/   Linux(엔진) · macOS(엔진 + 앱 빌드 · 시험 · Sill.app) 자동 검사
+```
+
 ## 로드맵
 
-1. **SwiftUI 앱** — VM 목록 · 만들기 마법사 · 시작/종료 버튼 · 메뉴 막대 아이콘 (엔진은 이 스크립트 그대로)
+1. 앱 아이콘 · Developer ID 서명 · 공증 → 다른 Mac 에 배포
 2. RDP RemoteApp 으로 Windows 앱 하나만 Mac 창처럼 띄우기(Coherence 대체)
 3. USB 장치 연결 · 실행 중 일시정지/재개
+
+## 라이선스
+
+[MIT](LICENSE) © 2026 OTHNIELDEV. Sill 은 QEMU · swtpm 을 별도 프로그램으로 실행만 하며 함께 배포하지 않습니다(각자 GPL 등 자체 라이선스).

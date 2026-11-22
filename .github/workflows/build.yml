@@ -1,0 +1,53 @@
+name: build
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  # 엔진(sill)을 Linux 에서 — Apple Silicon 경로(aarch64)를 소프트웨어 에뮬레이션으로 부팅까지
+  engine-linux:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: 도구 설치
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qemu-system-arm qemu-utils qemu-efi-aarch64 swtpm swtpm-tools xorriso shellcheck
+      - name: 정적 검사
+        run: shellcheck -S warning sill test/smoke.sh app/scripts/build-app.sh
+      - name: 연기 시험 (aarch64)
+        run: SILL_ACCEL=tcg SILL_ARCH=aarch64 ./test/smoke.sh
+
+  # 실제 macOS 에서 — 엔진(bash 3.2 · Homebrew QEMU) + SwiftUI 앱 빌드 · 시험 · Sill.app 묶음
+  macos:
+    runs-on: macos-15
+    timeout-minutes: 40
+    env:
+      HOMEBREW_NO_AUTO_UPDATE: "1"
+      HOMEBREW_NO_INSTALL_CLEANUP: "1"
+      # GitHub 의 macOS 실행기는 가상 머신이라 HVF(중첩 가상화)를 못 쓴다 — 소프트웨어 에뮬레이션으로 시험한다.
+      SILL_ACCEL: tcg
+    steps:
+      - uses: actions/checkout@v4
+      - name: QEMU · swtpm 설치
+        run: brew install qemu swtpm
+      - name: 엔진 점검
+        run: ./sill doctor
+      - name: 엔진 연기 시험
+        run: ./test/smoke.sh
+      - name: Swift 판
+        run: swift --version
+      - name: 앱 빌드
+        run: swift build --package-path app
+      - name: 앱 시험 (실제 엔진 실행 포함)
+        run: swift test --package-path app
+      - name: Sill.app 묶음
+        run: ./app/scripts/build-app.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Sill-app
+          path: app/build/Sill-*.zip
+          if-no-files-found: error
