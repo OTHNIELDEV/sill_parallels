@@ -303,6 +303,12 @@ detach_fds() {
   return 0
 }
 
+show_log_tail() { # 실패 원인을 바로 보이게 로그 끝 몇 줄
+  [ -s "$1" ] || return 0
+  printf '%s── %s (끝 8줄)%s\n' "$c_dim" "${1##*/}" "$c_off" >&2
+  tail -n 8 "$1" | sed 's/^/  /' >&2
+}
+
 port_in_use() { nc -z -w 1 127.0.0.1 "$1" >/dev/null 2>&1; }
 
 stop_tpm() { # QEMU 가 붙지 못하고 끝났을 때 남는 swtpm 을 치운다(--terminate 는 연결된 뒤에만 동작)
@@ -348,7 +354,7 @@ cmd_start() {
   info "▶ $NAME 시작 · RDP 127.0.0.1:$RDP_PORT ${c_dim}(sill rdp $NAME)${c_off}"
   if [ "$mode" = background ]; then
     if ! ( detach_fds; exec "$(qemu_bin)" "${args[@]}" ) </dev/null >"$VM/qemu.log" 2>&1; then
-      stop_tpm; die "QEMU 실행 실패 — $VM/qemu.log"
+      stop_tpm; show_log_tail "$VM/qemu.log"; die "QEMU 실행 실패 — $VM/qemu.log"
     fi
     ok "백그라운드 실행 중 · 화면: vnc://127.0.0.1:$((5900 + RDP_PORT - 33890 + 10))"
   else

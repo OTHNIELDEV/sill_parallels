@@ -7,7 +7,14 @@ HERE="$(cd "$(dirname "$0")/.." && pwd)"
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/sill-smoke.XXXX")"
 export SILL_HOME="$WORK/vms"
 W="$HERE/sill"
-fail() { echo "✗ $*" >&2; exit 1; }
+fail() {
+  echo "✗ $*" >&2
+  local f
+  for f in "$SILL_HOME"/*/qemu.log "$SILL_HOME"/*/swtpm.log; do
+    [ -s "$f" ] && { echo "── $f" >&2; tail -n 20 "$f" >&2; }
+  done
+  exit 1
+}
 cleanup() { "$W" stop smoke --force >/dev/null 2>&1 || true; rm -rf "$WORK"; }
 trap cleanup EXIT
 
