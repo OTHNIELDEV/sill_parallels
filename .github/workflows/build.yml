@@ -17,7 +17,7 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y -qq qemu-system-arm qemu-utils qemu-efi-aarch64 swtpm swtpm-tools xorriso shellcheck
       - name: 정적 검사
-        run: shellcheck -S warning sill test/smoke.sh app/scripts/build-app.sh
+        run: shellcheck -S warning sill test/smoke.sh app/scripts/build-app.sh app/scripts/build-dmg.sh
       - name: 연기 시험 (aarch64)
         run: SILL_ACCEL=tcg SILL_ARCH=aarch64 ./test/smoke.sh
 
@@ -44,10 +44,12 @@ jobs:
         run: swift build --package-path app
       - name: 앱 시험 (실제 엔진 실행 포함)
         run: swift test --package-path app
-      - name: Sill.app 묶음
-        run: ./app/scripts/build-app.sh
+      - name: Sill.app · DMG 묶음
+        run: ./app/scripts/build-dmg.sh
       - uses: actions/upload-artifact@v4
         with:
           name: Sill-app
-          path: app/build/Sill-*.zip
+          path: |
+            app/build/Sill-*.dmg
+            app/build/Sill-*.zip
           if-no-files-found: error

@@ -1,0 +1,21 @@
+Sill — Mac 위의 Windows 창턱
+=============================
+
+1. Sill.app 을 옆의 「Applications(응용 프로그램)」 폴더로 끌어 넣습니다.
+
+2. 처음 한 번만 — macOS 가 「확인되지 않은 개발자」라며 막으면:
+   · Sill 을 한 번 열어 본 뒤
+     시스템 설정 → 개인정보 보호 및 보안 → 맨 아래 「그래도 열기」
+   · 또는 터미널에서:
+       xattr -dr com.apple.quarantine /Applications/Sill.app
+   (Apple 개발자 서명이 없는 개인용 빌드라서 생기는 절차입니다.)
+
+3. 가상화 도구를 설치합니다 (Homebrew 필요 — https://brew.sh):
+       brew install qemu swtpm
+   또는 Sill 의 「준비 상태 점검 → 필요한 도구 설치」 단추.
+
+4. Sill 에서 「준비 상태 점검 → virtio 드라이버 받기」(Apple Silicon 인터넷용),
+   ⌘N 으로 새 VM → Windows 11 ISO 고르기 → 시작.
+   Apple Silicon 은 Windows 11 ARM64 ISO 가 필요합니다(Microsoft 공식 다운로드).
+
+자세한 안내: https://github.com/OTHNIELDEV/sill_parallels

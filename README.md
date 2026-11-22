@@ -13,6 +13,18 @@ Parallels Desktop 처럼 Mac 위에 Windows 가상 머신을 만들고 실행하
 
 > Apple Silicon 에서는 **x64 Windows 를 실행할 수 없습니다**(Parallels 도 같음). 반드시 ARM64 판 ISO 를 쓰세요.
 
+## 내려받기
+
+**[최신 판 받기 → Releases](https://github.com/OTHNIELDEV/sill_parallels/releases/latest)** — `Sill-<판>.dmg` (Apple Silicon · Intel 공용)
+
+1. DMG 를 열고 `Sill.app` 을 「Applications」로 끌어 넣습니다.
+2. 처음 한 번 — 개인용 빌드(Apple 개발자 서명 없음)라 macOS 가 막습니다. 한 번 열어 본 뒤
+   **시스템 설정 → 개인정보 보호 및 보안 → 「그래도 열기」**, 또는 `xattr -dr com.apple.quarantine /Applications/Sill.app`
+3. `brew install qemu swtpm` (또는 앱의 「준비 상태 점검」)
+
+새 판 내기: 엔진 `sill` 의 `VERSION` 을 올려 main 에 푸시 → Actions 의 **release** 워크플로 「Run workflow」
+(또는 `git tag v<판> && git push --tags`). DMG 를 직접 만들려면 `./app/scripts/build-dmg.sh [--universal]`.
+
 ## 0. 앱으로 쓰기 (SwiftUI · macOS 13 이상)
 
 ```bash
@@ -135,7 +147,8 @@ app/                 SwiftUI 앱 (Swift Package)
   Sources/SillCore   엔진 실행 · VM 목록 · 입력 검사 (Foundation 만 — Linux 에서도 시험)
   Sources/SillApp    화면 (macOS 전용)
   Tests/             단위 시험 + 실제 엔진으로 VM 만들기 · 부팅 · 종료 · 삭제
-  scripts/build-app.sh  Sill.app 묶음
+  scripts/build-app.sh  Sill.app 묶음 · build-dmg.sh DMG
+.github/workflows/release.yml  범용 DMG · zip → GitHub Release
 .github/workflows/   Linux(엔진) · macOS(엔진 + 앱 빌드 · 시험 · Sill.app) 자동 검사
 ```
 

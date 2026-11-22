@@ -1,0 +1,57 @@
+name: release
+
+# 판 번호는 엔진 sill 의 VERSION 이 정본이다 → 태그 v<VERSION> 의 GitHub Release 에
+# 범용(Apple Silicon + Intel) DMG · zip 을 올린다.
+#   - Actions 화면에서 「Run workflow」 → 지금 main 으로 만든다(태그가 없으면 새로 만든다)
+#   - 또는 태그 v0.1.0 을 푸시
+on:
+  workflow_dispatch:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 판 번호
+        id: v
+        run: |
+          v="$(sed -n 's/^VERSION="\(.*\)"$/\1/p' sill)"
+          [ -n "$v" ] || { echo "::error::sill 에서 VERSION 을 읽지 못했습니다"; exit 1; }
+          if [ "$GITHUB_REF_TYPE" = tag ] && [ "$GITHUB_REF_NAME" != "v$v" ]; then
+            echo "::error::태그 $GITHUB_REF_NAME 와 엔진 판 v$v 가 다릅니다"; exit 1
+          fi
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+
+      - name: 범용 앱 · DMG
+        run: ./app/scripts/build-dmg.sh --universal
+
+      - name: 두 칩 모두 들어 있는지
+        run: |
+          archs="$(lipo -archs app/build/Sill.app/Contents/MacOS/Sill)"
+          echo "아키텍처: $archs"
+          echo "$archs" | grep -q arm64
+          echo "$archs" | grep -q x86_64
+          codesign --verify --deep app/build/Sill.app
+
+      - name: GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.v.outputs.version }}
+        run: |
+          tag="v$VERSION"
+          files=(app/build/Sill-$VERSION.dmg app/build/Sill-$VERSION.zip)
+          sed "s/@VERSION@/$VERSION/g" .github/release-notes.md > notes.md
+          ( cd app/build && shasum -a 256 "Sill-$VERSION.dmg" "Sill-$VERSION.zip" ) | tee -a notes.md
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" "${files[@]}" --clobber
+          else
+            gh release create "$tag" "${files[@]}" --target "$GITHUB_SHA" \
+              --title "Sill $VERSION" --notes-file notes.md --latest
+          fi
